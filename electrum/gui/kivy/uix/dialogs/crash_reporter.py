@@ -119,8 +119,11 @@ class CrashReporter(BaseCrashReporter, Factory.Popup):
         try:
             loop = self.main_window.network.asyncio_loop
             proxy = self.main_window.network.proxy
-            response = json.loads(BaseCrashReporter.send_report(self, loop, proxy, "/crash.json"))
+            # FIXME network request in GUI thread...
+            response = json.loads(BaseCrashReporter.send_report(self, loop, proxy,
+                                                                "/crash.json", timeout=10))
         except (ValueError, ClientError):
+            #self.logger.debug("", exc_info=True)
             self.show_popup(_('Unable to send report'), _("Please check your network connection."))
         else:
             self.show_popup(_('Report sent'), response["text"])
@@ -155,14 +158,6 @@ class CrashReporter(BaseCrashReporter, Factory.Popup):
 
     def get_wallet_type(self):
         return self.main_window.wallet.wallet_type
-
-    def get_os_version(self):
-        if utils.platform is not "android":
-            return utils.platform
-        import jnius
-        bv = jnius.autoclass('android.os.Build$VERSION')
-        b = jnius.autoclass('android.os.Build')
-        return "Android {} on {} {} ({})".format(bv.RELEASE, b.BRAND, b.DEVICE, b.DISPLAY)
 
 
 class CrashReportDetails(Factory.Popup):

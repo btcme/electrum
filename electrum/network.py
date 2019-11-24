@@ -20,6 +20,7 @@
 # ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import asyncio
 import time
 import queue
 import os
@@ -32,7 +33,7 @@ import json
 import sys
 import ipaddress
 import asyncio
-from typing import NamedTuple, Optional, Sequence, List, Dict, Tuple
+from typing import NamedTuple, Optional, Sequence, List, Dict, Tuple, TYPE_CHECKING
 import traceback
 
 import dns
@@ -52,14 +53,22 @@ from . import blockchain
 from . import bitcoin
 from .blockchain import Blockchain, HEADER_SIZE
 from .interface import (Interface, serialize_server, deserialize_server,
-                        RequestTimedOut, NetworkTimeout, BUCKET_NAME_OF_ONION_SERVERS)
+                        RequestTimedOut, NetworkTimeout, BUCKET_NAME_OF_ONION_SERVERS,
+                        NetworkException)
 from .version import PROTOCOL_VERSION
 from .simple_config import SimpleConfig
 from .i18n import _
 from .logging import get_logger, Logger
 
+if TYPE_CHECKING:
+    from .channel_db import ChannelDB
+    from .lnworker import LNGossip
+    from .lnwatcher import WatchTower
+    from .transaction import Transaction
+
 
 _logger = get_logger(__name__)
+
 
 
 NODES_RETRY_INTERVAL = 60
@@ -174,10 +183,10 @@ def deserialize_proxy(s: str) -> Optional[dict]:
     return proxy
 
 
-class BestEffortRequestFailed(Exception): pass
+class BestEffortRequestFailed(NetworkException): pass
 
 
-class TxBroadcastError(Exception):
+class TxBroadcastError(NetworkException):
     def get_message_for_gui(self):
         raise NotImplementedError()
 
@@ -205,7 +214,7 @@ class TxBroadcastUnknownError(TxBroadcastError):
                     _("Consider trying to connect to a different server, or updating Electrum."))
 
 
-class UntrustedServerReturnedError(Exception):
+class UntrustedServerReturnedError(NetworkException):
     def __init__(self, *, original_exception):
         self.original_exception = original_exception
 
@@ -216,7 +225,7 @@ class UntrustedServerReturnedError(Exception):
         return f"<UntrustedServerReturnedError original_exception: {repr(self.original_exception)}>"
 
 
-INSTANCE = None
+_INSTANCE = None
 
 
 class Network(Logger):
@@ -224,9 +233,12 @@ class Network(Logger):
     servers, each connected socket is handled by an Interface() object.
     """
 
-    def __init__(self, config: SimpleConfig=None):
-        global INSTANCE
-        INSTANCE = self
+    LOGGING_SHORTCUT = 'n'
+
+    def __init__(self, config: SimpleConfig):
+        global _INSTANCE
+        assert _INSTANCE is None, "Network is a singleton!"
+        _INSTANCE = self
 
         Logger.__init__(self)
 
@@ -234,9 +246,8 @@ class Network(Logger):
         assert self.asyncio_loop.is_running(), "event loop not running"
         self._loop_thread = None  # type: threading.Thread  # set by caller; only used for sanity checks
 
-        if config is None:
-            config = {}  # Do not use mutables as default values!
-        self.config = SimpleConfig(config) if isinstance(config, dict) else config  # type: SimpleConfig
+        assert isinstance(config, SimpleConfig), f"config should be a SimpleConfig instead of {type(config)}"
+        self.config = config
         blockchain.read_blockchains(self.config)
         self.logger.info(f"blockchains {list(map(lambda b: b.forkpoint, blockchain.blockchains.values()))}")
         self._blockchain_preferred_block = self.config.get('blockchain_preferred_block', None)  # type: Optional[Dict]
@@ -291,14 +302,34 @@ class Network(Logger):
 
         self._set_status('disconnected')
 
-    def run_from_another_thread(self, coro):
+        # lightning network
+        self.channel_db = None  # type: Optional[ChannelDB]
+        self.lngossip = None  # type: Optional[LNGossip]
+        self.local_watchtower = None  # type: Optional[WatchTower]
+
+    def maybe_init_lightning(self):
+        if self.channel_db is None:
+            from . import lnwatcher
+            from . import lnworker
+            from . import lnrouter
+            from . import channel_db
+            self.channel_db = channel_db.ChannelDB(self)
+            self.path_finder = lnrouter.LNPathFinder(self.channel_db)
+            self.lngossip = lnworker.LNGossip(self)
+            self.local_watchtower = lnwatcher.WatchTower(self) if self.config.get('local_watchtower', False) else None
+            self.lngossip.start_network(self)
+            if self.local_watchtower:
+                self.local_watchtower.start_network(self)
+                asyncio.ensure_future(self.local_watchtower.start_watching)
+
+    def run_from_another_thread(self, coro, *, timeout=None):
         assert self._loop_thread != threading.current_thread(), 'must not be called from network thread'
         fut = asyncio.run_coroutine_threadsafe(coro, self.asyncio_loop)
-        return fut.result()
+        return fut.result(timeout)
 
     @staticmethod
     def get_instance() -> Optional["Network"]:
-        return INSTANCE
+        return _INSTANCE
 
     def with_recent_servers_lock(func):
         def func_wrapper(self, *args, **kwargs):
@@ -474,20 +505,26 @@ class Network(Logger):
 
     @with_recent_servers_lock
     def get_servers(self):
-        # start with hardcoded servers
-        out = dict(constants.net.DEFAULT_SERVERS)  # copy
+        # note: order of sources when adding servers here is crucial!
+        # don't let "server_peers" overwrite anything,
+        # otherwise main server can eclipse the client
+        out = dict()
+        # add servers received from main interface
+        server_peers = self.server_peers
+        if server_peers:
+            out.update(filter_version(server_peers.copy()))
+        # hardcoded servers
+        out.update(constants.net.DEFAULT_SERVERS)
         # add recent servers
         for s in self.recent_servers:
             try:
                 host, port, protocol = deserialize_server(s)
             except:
                 continue
-            if host not in out:
+            if host in out:
+                out[host].update({protocol: port})
+            else:
                 out[host] = {protocol: port}
-        # add servers received from main interface
-        server_peers = self.server_peers
-        if server_peers:
-            out.update(filter_version(server_peers.copy()))
         # potentially filter out some
         if self.config.get('noonion'):
             out = filter_noonion(out)
@@ -541,26 +578,27 @@ class Network(Logger):
             return True
         def resolve_with_dnspython(host):
             addrs = []
+            expected_dnspython_errors = (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer)
             # try IPv6
             try:
                 answers = dns.resolver.query(host, dns.rdatatype.AAAA)
                 addrs += [str(answer) for answer in answers]
-            except dns.exception.DNSException as e:
+            except expected_dnspython_errors as e:
                 pass
             except BaseException as e:
-                _logger.info(f'dnspython failed to resolve dns (AAAA) with error: {e}')
+                _logger.info(f'dnspython failed to resolve dns (AAAA) for {repr(host)} with error: {repr(e)}')
             # try IPv4
             try:
                 answers = dns.resolver.query(host, dns.rdatatype.A)
                 addrs += [str(answer) for answer in answers]
-            except dns.exception.DNSException as e:
+            except expected_dnspython_errors as e:
                 # dns failed for some reason, e.g. dns.resolver.NXDOMAIN this is normal.
                 # Simply report back failure; except if we already have some results.
                 if not addrs:
                     raise socket.gaierror(11001, 'getaddrinfo failed') from e
             except BaseException as e:
-                # Possibly internal error in dnspython :( see #4483
-                _logger.info(f'dnspython failed to resolve dns (A) with error: {e}')
+                # Possibly internal error in dnspython :( see #4483 and #5638
+                _logger.info(f'dnspython failed to resolve dns (A) for {repr(host)} with error: {repr(e)}')
             if addrs:
                 return addrs
             # Fall back to original socket.getaddrinfo to resolve dns.
@@ -850,11 +888,11 @@ class Network(Logger):
         return await self.interface.session.send_request('blockchain.transaction.get_merkle', [tx_hash, tx_height])
 
     @best_effort_reliable
-    async def broadcast_transaction(self, tx, *, timeout=None) -> None:
+    async def broadcast_transaction(self, tx: 'Transaction', *, timeout=None) -> None:
         if timeout is None:
             timeout = self.get_network_timeout_seconds(NetworkTimeout.Urgent)
         try:
-            out = await self.interface.session.send_request('blockchain.transaction.broadcast', [str(tx)], timeout=timeout)
+            out = await self.interface.session.send_request('blockchain.transaction.broadcast', [tx.serialize()], timeout=timeout)
             # note: both 'out' and exception messages are untrusted input from the server
         except (RequestTimedOut, asyncio.CancelledError, asyncio.TimeoutError):
             raise  # pass-through
@@ -971,10 +1009,15 @@ class Network(Logger):
         # https://github.com/bitcoin/bitcoin/blob/cd42553b1178a48a16017eff0b70669c84c3895c/src/rpc/rawtransaction.cpp
         # grep "RPC_TRANSACTION"
         # grep "RPC_DESERIALIZATION_ERROR"
+        # https://github.com/bitcoin/bitcoin/blob/d7d7d315060620446bd363ca50f95f79d3260db7/src/util/error.cpp
         rawtransaction_error_messages = {
             r"Missing inputs",
             r"transaction already in block chain",
+            r"Transaction already in block chain",
             r"TX decode failed",
+            r"Peer-to-peer functionality missing or disabled",
+            r"Transaction rejected by AcceptToMemoryPool",
+            r"AcceptToMemoryPool failed",
         }
         for substring in rawtransaction_error_messages:
             if substring in server_msg:
@@ -1038,6 +1081,11 @@ class Network(Logger):
         if not is_hash256_str(sh):
             raise Exception(f"{repr(sh)} is not a scripthash")
         return await self.interface.session.send_request('blockchain.scripthash.get_balance', [sh])
+
+    @best_effort_reliable
+    async def get_txid_from_txpos(self, tx_height, tx_pos, merkle):
+        command = 'blockchain.transaction.id_from_pos'
+        return await self.interface.session.send_request(command, [tx_height, tx_pos, merkle])
 
     def blockchain(self) -> Blockchain:
         interface = self.interface
@@ -1124,8 +1172,8 @@ class Network(Logger):
                 async with main_taskgroup as group:
                     await group.spawn(self._maintain_sessions())
                     [await group.spawn(job) for job in self._jobs]
-            except Exception as e:
-                self.logger.exception('')
+            except BaseException as e:
+                self.logger.exception('main_taskgroup died.')
                 raise e
         asyncio.run_coroutine_threadsafe(main(), self.asyncio_loop)
 

@@ -70,12 +70,6 @@
         "t": "50001",
         "version": "1.4"
     },
-    "cashyes.zapto.org": {
-        "pruning": "-",
-        "s": "50002",
-        "t": "50001",
-        "version": "1.4"
-    },
     "currentlane.lovebitco.in": {
         "pruning": "-",
         "s": "50002",
@@ -88,10 +82,10 @@
         "t": "50001",
         "version": "1.4"
     },
-    "dedi.jochen-hoenicke.de": {
+    "electrum.jochen-hoenicke.de": {
         "pruning": "-",
-        "s": "50002",
-        "t": "50001",
+        "s": "50005",
+        "t": "50003",
         "version": "1.4"
     },
     "dragon085.startdedicated.de": {
@@ -197,18 +191,6 @@
         "s": "50002",
         "version": "1.4"
     },
-    "electrumx.ml": {
-        "pruning": "-",
-        "s": "50002",
-        "t": "50001",
-        "version": "1.4"
-    },
-    "electrumx.nmdps.net": {
-        "pruning": "-",
-        "s": "50002",
-        "t": "50001",
-        "version": "1.4"
-    },
     "electrumx.soon.it": {
         "pruning": "-",
         "s": "50002",
@@ -227,12 +209,6 @@
         "version": "1.4"
     },
     "enode.duckdns.org": {
-        "pruning": "-",
-        "s": "50002",
-        "t": "50001",
-        "version": "1.4"
-    },
-    "erbium1.sytes.net": {
         "pruning": "-",
         "s": "50002",
         "t": "50001",
@@ -342,12 +318,6 @@
         "t": "50001",
         "version": "1.4"
     },
-    "us.electrum.be": {
-        "pruning": "-",
-        "s": "50002",
-        "t": "50001",
-        "version": "1.4"
-    },
     "vmd27610.contaboserver.net": {
         "pruning": "-",
         "s": "50002",
@@ -422,7 +392,7 @@
     },
     "fortress.qtornado.com": {
         "pruning": "-",
-        "s": "50002",
+        "s": "443",
         "t": "50001",
         "version": "1.4"
     },
@@ -430,6 +400,12 @@
         "pruning": "-",
         "s": "56002",
         "t": "56001",
+        "version": "1.4"
+    },
+    "electrumx.erbium.eu": {
+        "pruning": "-",
+        "s": "50002",
+        "t": "50001",
         "version": "1.4"
     }
 }
