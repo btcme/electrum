@@ -18,6 +18,7 @@ from electrum.util import InvalidPassword
 from electrum.address_synchronizer import TX_HEIGHT_LOCAL
 from electrum.wallet import CannotBumpFee
 from electrum.transaction import Transaction, PartialTransaction
+from ...util import address_colors
 
 if TYPE_CHECKING:
     from ...main_window import ElectrumWindow
@@ -181,7 +182,11 @@ class TxDialog(Factory.Popup):
             self.fee_str = _('unknown')
             self.feerate_str = _('unknown')
         self.ids.output_list.update(self.tx.outputs())
-        self.is_local_tx = tx_mined_status.height == TX_HEIGHT_LOCAL
+
+        for dict_entry in self.ids.output_list.data:
+            dict_entry['color'], dict_entry['background_color'] = address_colors(self.wallet, dict_entry['address'])
+
+        self.can_remove_tx = tx_details.can_remove
         self.update_action_button()
 
     def update_action_button(self):
@@ -190,7 +195,7 @@ class TxDialog(Factory.Popup):
             ActionButtonOption(text=_('Sign'), func=lambda btn: self.do_sign(), enabled=self.can_sign),
             ActionButtonOption(text=_('Broadcast'), func=lambda btn: self.do_broadcast(), enabled=self.can_broadcast),
             ActionButtonOption(text=_('Bump fee'), func=lambda btn: self.do_rbf(), enabled=self.can_rbf),
-            ActionButtonOption(text=_('Remove'), func=lambda btn: self.remove_local_tx(), enabled=self.is_local_tx),
+            ActionButtonOption(text=_('Remove'), func=lambda btn: self.remove_local_tx(), enabled=self.can_remove_tx),
         )
         num_options = sum(map(lambda o: bool(o.enabled), options))
         # if no options available, hide button
@@ -289,7 +294,7 @@ class TxDialog(Factory.Popup):
             if b:
                 for tx in to_delete:
                     self.wallet.remove_transaction(tx)
-                self.wallet.storage.write()
+                self.wallet.save_db()
                 self.app._trigger_update_wallet()  # FIXME private...
                 self.dismiss()
         d = Question(question, on_prompt)
